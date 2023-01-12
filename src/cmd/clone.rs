@@ -1,14 +1,14 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::Result;
 use clap::Parser;
 use console::style;
 use git2::Repository;
-use itertools::Itertools;
 use tracing::info;
 
 use crate::config::Config;
-use crate::console::Spinner;
+use crate::console::MultiSpinner;
 use crate::git::{CloneOptions, CloneRepository};
 use crate::path::Path;
 use crate::root::Root;
@@ -34,21 +34,30 @@ pub struct Cmd {
 
 impl Cmd {
     pub async fn run(self) -> Result<()> {
-        let root = Root::find()?;
-        let config = Config::load_from(&root)?;
+        let root = Arc::new(Root::find()?);
+        let config = Arc::new(Config::load_from(&root)?);
 
-        let repo: Vec<CloneResult> = Spinner::new("Cloning the repository...")
-            .spin_while(|| async move {
-                Ok::<_, anyhow::Error>(
-                    self.repo
-                        .iter()
-                        .map(|repo| self.clone(&root, &config, repo))
-                        .try_collect()?,
+        let mut spinner = MultiSpinner::new();
+        for repo in &self.repo {
+            let repo = repo.clone();
+            let open = self.open.clone();
+            let root = Arc::clone(&root);
+            let config = Arc::clone(&config);
+
+            spinner = spinner.with_spin_while(format!("Cloning {}...", repo), move || async move {
+                Self::clone(
+                    &root,
+                    &config,
+                    &repo,
+                    open.as_deref(),
+                    CloneOptions {
+                        recursive: self.recursive,
+                    },
                 )
-            })
-            .await?;
+            });
+        }
 
-        repo.iter().for_each(
+        spinner.collect().await?.into_iter().for_each(
             |CloneResult {
                  path,
                  profile,
@@ -78,21 +87,25 @@ impl Cmd {
         Ok(())
     }
 
-    fn clone(&self, root: &Root, config: &Config, repo: &str) -> Result<CloneResult> {
+    fn clone(
+        root: &Root,
+        config: &Config,
+        repo: &str,
+        open: Option<&str>,
+        options: CloneOptions,
+    ) -> Result<CloneResult> {
         let url = Url::from_str(repo, config.defaults.owner.as_deref())?;
-        let path = PathBuf::from(Path::resolve(&root, &url));
+        let path = PathBuf::from(Path::resolve(root, &url));
         let profile = config
             .rules
             .resolve(&url)
             .and_then(|r| config.profiles.resolve(&r.profile));
 
-        config.git.strategy.clone.clone_repository(
-            url,
-            &path,
-            &CloneOptions {
-                recursive: self.recursive,
-            },
-        )?;
+        config
+            .git
+            .strategy
+            .clone
+            .clone_repository(url, &path, &options)?;
 
         let repo = Repository::open(&path)?;
         let profile = if let Some((name, p)) = profile {
@@ -102,8 +115,8 @@ impl Cmd {
             None
         };
 
-        let open = if let Some(app) = &self.open {
-            config.applications.open_or_intermediate(&app, &path)?;
+        let open = if let Some(app) = open {
+            config.applications.open_or_intermediate(app, &path)?;
             Some(app.to_string())
         } else {
             None
